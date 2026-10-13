@@ -11,11 +11,52 @@ log = logging.getLogger(__name__)
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 54321
+PORT_RANGE = 10  # the addon takes the first free port in 54321-54330
 RECV_BUFFER = 1024 * 1024  # 1MB
 
 
 class NukeConnectionError(Exception):
     """Failed to connect or communicate with the Nuke addon."""
+
+
+def scan_instances(
+    host: str = DEFAULT_HOST,
+    start_port: int = DEFAULT_PORT,
+    count: int = PORT_RANGE,
+    timeout: float = 2.0,
+) -> list[dict]:
+    """Find running Nuke addons by probing the port range.
+
+    Returns one dict per responding port with the handshake fields
+    (nuke_version, variant, pid, script) plus "port". A Nuke that accepts the
+    connection but is too busy to answer is reported with "busy": True.
+    """
+    found = []
+    for port in range(start_port, start_port + count):
+        try:
+            sock = socket.create_connection((host, port), timeout=0.3)
+        except OSError:
+            continue
+        try:
+            sock.settimeout(timeout)
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(RECV_BUFFER)
+                if not chunk:
+                    break
+                buf += chunk
+            if b"\n" in buf:
+                info = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
+                info.pop("type", None)
+                found.append({"port": port, **info})
+        except (OSError, json.JSONDecodeError):
+            found.append({"port": port, "busy": True})
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return found
 
 
 class NukeConnection:
@@ -56,6 +97,7 @@ class NukeConnection:
                 self.sock.settimeout(10.0)
                 self.sock.connect((self.host, self.port))
                 self._buffer = b""
+                self._response_queue = queue.Queue()
                 self.handshake = self._read_message()
                 log.info(
                     "Connected to Nuke %s (%s) at %s:%d",
@@ -86,10 +128,46 @@ class NukeConnection:
             f"after {retries} attempts: {last_error}"
         )
 
+    def ensure_connected(self) -> dict:
+        """Connect lazily: try the current port, else the first Nuke found.
+
+        Lets the MCP server start before Nuke, and recover when the Nuke it
+        was talking to is closed.
+        """
+        if self.sock:
+            return self.handshake
+        try:
+            return self.connect(retries=1)
+        except NukeConnectionError:
+            pass
+        for inst in scan_instances(self.host):
+            if inst.get("busy"):
+                continue
+            self.port = inst["port"]
+            try:
+                return self.connect(retries=1)
+            except NukeConnectionError:
+                continue
+        raise NukeConnectionError(
+            f"No Nuke addon found on ports {DEFAULT_PORT}-{DEFAULT_PORT + PORT_RANGE - 1}. "
+            "Open Nuke and start NukeMCP (Nodes > NukeMCP > Start Server)."
+        )
+
+    def switch(self, port: int) -> dict:
+        """Point this connection at the Nuke addon on another port."""
+        if self.sock and port == self.port:
+            return self.handshake
+        self.disconnect()
+        old_port, self.port = self.port, port
+        try:
+            return self.connect(retries=1)
+        except NukeConnectionError:
+            self.port = old_port
+            raise
+
     def send(self, command: dict, timeout: float = 10.0) -> dict:
         """Send a JSON command and return the JSON response."""
-        if not self.sock:
-            raise NukeConnectionError("Not connected to Nuke addon")
+        self.ensure_connected()
 
         msg = json.dumps(command) + "\n"
         try:
@@ -114,8 +192,9 @@ class NukeConnection:
 
     def disconnect(self):
         """Cleanly disconnect from the Nuke addon."""
-        self._stop_reader()
+        # Close first so the reader thread's blocking recv() returns
         self._close_socket()
+        self._stop_reader()
         self.handshake = None
         log.info("Disconnected from Nuke addon")
 
@@ -141,7 +220,9 @@ class NukeConnection:
         while self._reader_running:
             try:
                 msg = self._read_message()
-            except (NukeConnectionError, OSError):
+            except (NukeConnectionError, OSError, AttributeError):
+                # Nuke closed or we disconnected; next send() reconnects
+                self._close_socket()
                 break
             if msg.get("type") == "event":
                 if self._event_handler:
